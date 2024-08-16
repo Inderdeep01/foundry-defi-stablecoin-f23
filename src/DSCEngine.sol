@@ -53,6 +53,8 @@ contract DSCEngine is ReentrancyGuard{
     error DSCEngine__TransferFailed();
     error DSCEngine__MintFailed();
     error DSCEngine__HealthFactorUnhealthy(uint256 healthFactor);
+    error DSCEngine__HealthFactorHealthy(uint256 healthFactor);
+    error DSCEngine__HealthFactorNotImproved();
 
       //////////////////////////////////
      //          STATE VARIABLES     //
@@ -61,7 +63,9 @@ contract DSCEngine is ReentrancyGuard{
     uint256 private constant PRECISION_CORRECTION = 1e18;
     uint256 private constant LIQUIDATION_THRESHOLD = 50;
     uint256 private constant LIQUIDATION_PRECISION = 100;
-    uint256 private constant MIN_HEALTH_FACTOR = 1;
+    uint256 private constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 private constant LIQUIDATION_BONUS = 10;
+    uint256 private constant LIQUIDATION_BONUS_PRECISION_CORRECTION = 100;
     mapping(address token => address priceFeeds) private s_priceFeeds;
     DecentralizedStableCoin private immutable i_dsc;
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -72,6 +76,7 @@ contract DSCEngine is ReentrancyGuard{
      //             EVENTS           //
     //////////////////////////////////
     event CollateralDeposited(address indexed depositor, address indexed collateralToken, uint256 amount);
+    event CollateralRedeemed(address indexed redeemer, address indexed redeemedTo, address indexed collateralToken, uint256 amount);
 
       //////////////////////////////////
      //            MODIFIERS         //
@@ -104,14 +109,14 @@ contract DSCEngine is ReentrancyGuard{
         i_dsc = DecentralizedStableCoin(dscAddress);
     }
 
-      //////////////////////////////////
-     //      EXTERNAL FUNCTIONS      //
-    //////////////////////////////////
+      ///////////////////////////////////////
+     //      EXTERNAL & PUBLIC FUNCTIONS  //
+    ///////////////////////////////////////
     /*
      * @notice Follows the CEI pattern
      * @param collateralToken The address of the token to deposit as collateral
      * @param collateralAmount The amount of collateral to deposit */
-    function depositCollateral(address collateralToken, uint256 collateralAmount) external nonZero(collateralAmount) onlyAllowedCollateral(collateralToken) nonReentrant{
+    function depositCollateral(address collateralToken, uint256 collateralAmount) public nonZero(collateralAmount) onlyAllowedCollateral(collateralToken) nonReentrant{
         s_collateralDeposited[msg.sender][collateralToken] += collateralAmount;
         emit CollateralDeposited(msg.sender, collateralToken, collateralAmount);
         bool success = IERC20(collateralToken).transferFrom(msg.sender, address(this), collateralAmount);
@@ -124,13 +129,74 @@ contract DSCEngine is ReentrancyGuard{
      * @param _amount The amount of DSC to mint
      * @notice Follows the CEI pattern
      * @notice The user must have more collateral value in $$$ than the minimum threshold */
-    function mintDsc(uint256 _amount) external nonZero(_amount) nonReentrant {
+    function mintDsc(uint256 _amount) public nonZero(_amount) nonReentrant {
         s_DSCMinted[msg.sender] += _amount;
         _revertIfHealthFactorIsBroken(msg.sender);
         bool minted = i_dsc.mint(msg.sender, _amount);
         if (!minted){
             revert DSCEngine__MintFailed();
         }
+    }
+
+    /*
+     * @notice Deposit Collateral and Mint DSC in one transaction
+     * @param collateralToken The address of the token to deposit as collateral
+     * @param collateralAmount The amount of collateral to deposit
+     * @param amountDsc The amount of DSC to mint */
+    function depositCollateralAndMintDsc(address collateralToken, uint256 collateralAmount, uint256 amountDsc) external {
+        depositCollateral(collateralToken, collateralAmount);
+        mintDsc(amountDsc);
+    }
+
+    /*
+     * @param collateralToken The address of collateral to redeem/withdraw
+     * @param collateralAmount The amount of collateral to redeem/withdraw */
+    function redeemCollateral(address collateralToken, uint256 collateralAmount) public nonZero(collateralAmount) nonReentrant {
+        _redeemCollateral(collateralToken, collateralAmount, msg.sender, msg.sender);
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
+
+    /*
+     * @param _amount The amount of DSC to burn */
+    function burnDsc(uint256 _amount) nonZero(_amount) public {
+        _burnDsc(msg.sender, msg.sender, _amount);
+    }
+
+    /*
+     * @param collateralToken The address of collateral to redeem/withdraw
+     * @param collateralAmount The amount of collateral to redeem/withdraw
+     * @param collateralAmount The amount of DSC to burn
+     * @notice This function burns DSC and redeems collateral in one transaction */
+    function redeemCollateralForDsc(address collateralToken, uint256 collateralAmount, uint256 dscAmount) external{
+        burnDsc(dscAmount);
+        redeemCollateral(collateralToken, collateralAmount);
+    }
+
+    /*
+     * @param collateralToken The address of collateral token to be liquidated
+     * @param user The address of the user with broken healthFactor
+     * @param debtToCover The amount of DSC to burn to improve the broke user's health factor
+     * @notice You can partially liquidate a user
+     * @notice You will get the liquidation bonus for exiting the user's open position
+     * @notice This function works if the protocol is over-collateralized
+     * @dev Follows Checks Effects Interactions (CEI) pattern */
+    function liquidate(address collateralToken, address user, uint256 debtToCover) external nonZero(debtToCover) nonReentrant {
+        // Check health factor of the user
+        uint256 initialHealthFactor = _healthFactor(user);
+        if(initialHealthFactor >= MIN_HEALTH_FACTOR){
+            revert DSCEngine__HealthFactorHealthy(initialHealthFactor);
+        }
+        // Calculate the number of tokens to transfer from the amount of DSC sent (debtToCover) for liquidation request
+        uint256 amountToken = getTokenAmountFromUSD(collateralToken, debtToCover);
+        uint256 liquidationBonus = (amountToken * LIQUIDATION_BONUS) / LIQUIDATION_BONUS_PRECISION_CORRECTION;
+        uint256 totalCollateral = amountToken + liquidationBonus;
+        _redeemCollateral(collateralToken, totalCollateral, user, msg.sender);
+        _burnDsc(user, msg.sender, debtToCover);
+        uint256 finalHealthFactor = _healthFactor(user);
+        if(finalHealthFactor <= initialHealthFactor) {
+            revert DSCEngine__HealthFactorNotImproved();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
     }
 
       ////////////////////////////////////////////
@@ -159,6 +225,24 @@ contract DSCEngine is ReentrancyGuard{
         }
     }
 
+    function _redeemCollateral(address token, uint256 _amount, address _from, address _to) private {
+        s_collateralDeposited[_from][token] -= _amount;
+        emit CollateralRedeemed(_from, _to, token, _amount);
+        bool success = IERC20(token).transfer(_to, _amount);
+        if(!success) {
+            revert DSCEngine__TransferFailed();
+        }
+    }
+
+    function _burnDsc(address _onBehalfOf, address _from, uint256 _amount) private {
+        s_DSCMinted[_onBehalfOf] -= _amount;
+        bool success = i_dsc.transferFrom(_from, address(this), _amount);
+        if(!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        i_dsc.burn(_amount);
+    }
+
       /////////////////////////////////////////////
      //      PUBLIC & EXTERNAL "VIEW" FUNCTIONS //
     /////////////////////////////////////////////
@@ -183,4 +267,11 @@ contract DSCEngine is ReentrancyGuard{
         (,int256 price,,,) = priceFeed.latestRoundData();
         return ((uint256(price) * FEED_PRECISION_CORRECTION) * amount) / PRECISION_CORRECTION;
     }
+
+    function getTokenAmountFromUSD(address token, uint256 usdAmount) public view returns(uint256){
+        AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
+        (,int256 price,,,) = priceFeed.latestRoundData();
+        return (usdAmount * PRECISION_CORRECTION) / (uint256(price) * FEED_PRECISION_CORRECTION);
+    }
+
 }
