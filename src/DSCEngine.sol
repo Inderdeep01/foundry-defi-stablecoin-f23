@@ -55,6 +55,7 @@ contract DSCEngine is ReentrancyGuard{
     error DSCEngine__HealthFactorUnhealthy(uint256 healthFactor);
     error DSCEngine__HealthFactorHealthy(uint256 healthFactor);
     error DSCEngine__HealthFactorNotImproved();
+    error DSCEngine__EngineShouldBeApprovedSpenderOfDSC(uint256 amount);
 
       //////////////////////////////////
      //          STATE VARIABLES     //
@@ -132,10 +133,12 @@ contract DSCEngine is ReentrancyGuard{
     function mintDsc(uint256 _amount) public nonZero(_amount) nonReentrant {
         s_DSCMinted[msg.sender] += _amount;
         _revertIfHealthFactorIsBroken(msg.sender);
+        _revertIfNotEnoughAllowanceProvided(msg.sender, _amount);
         bool minted = i_dsc.mint(msg.sender, _amount);
         if (!minted){
             revert DSCEngine__MintFailed();
         }
+
     }
 
     /*
@@ -153,7 +156,10 @@ contract DSCEngine is ReentrancyGuard{
      * @param collateralAmount The amount of collateral to redeem/withdraw */
     function redeemCollateral(address collateralToken, uint256 collateralAmount) public nonZero(collateralAmount) nonReentrant {
         _redeemCollateral(collateralToken, collateralAmount, msg.sender, msg.sender);
-        _revertIfHealthFactorIsBroken(msg.sender);
+        // Only need to check the health factor if user has some dsc minted
+        if (s_DSCMinted[msg.sender] != 0) {
+            _revertIfHealthFactorIsBroken(msg.sender);
+        }
     }
 
     /*
@@ -190,8 +196,13 @@ contract DSCEngine is ReentrancyGuard{
         uint256 amountToken = getTokenAmountFromUSD(collateralToken, debtToCover);
         uint256 liquidationBonus = (amountToken * LIQUIDATION_BONUS) / LIQUIDATION_BONUS_PRECISION_CORRECTION;
         uint256 totalCollateral = amountToken + liquidationBonus;
-        _redeemCollateral(collateralToken, totalCollateral, user, msg.sender);
+        uint256 availableCollateral = s_collateralDeposited[user][collateralToken];
+        if(totalCollateral > availableCollateral) {
+            uint256 difference = totalCollateral - availableCollateral;
+            totalCollateral -= difference;
+        }
         _burnDsc(user, msg.sender, debtToCover);
+        _redeemCollateral(collateralToken, totalCollateral, user, msg.sender);
         uint256 finalHealthFactor = _healthFactor(user);
         if(finalHealthFactor <= initialHealthFactor) {
             revert DSCEngine__HealthFactorNotImproved();
@@ -215,7 +226,13 @@ contract DSCEngine is ReentrancyGuard{
     function _healthFactor(address _user) private view returns(uint256) {
         (uint256 totalDscMinted, uint256 collateralValueUSD) = _getAccountInformation(_user);
         uint256 collateralAdjustedForThreshold = (collateralValueUSD * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
-        return (collateralAdjustedForThreshold * PRECISION_CORRECTION) / totalDscMinted;
+        uint256 healtFactor;
+        if(totalDscMinted == 0){
+            healtFactor = collateralAdjustedForThreshold;
+        } else {
+            healtFactor = (collateralAdjustedForThreshold / totalDscMinted) * PRECISION_CORRECTION;
+        }
+        return healtFactor;
     }
 
     function _revertIfHealthFactorIsBroken(address _user) internal view {
@@ -241,6 +258,14 @@ contract DSCEngine is ReentrancyGuard{
             revert DSCEngine__TransferFailed();
         }
         i_dsc.burn(_amount);
+    }
+
+    function _revertIfNotEnoughAllowanceProvided(address _user, uint256 _amount) private view {
+        uint256 initialBalance = s_DSCMinted[_user];
+        uint256 approvedAmount = i_dsc.allowance(_user, address(this));
+        if(approvedAmount < initialBalance+_amount){
+            revert DSCEngine__EngineShouldBeApprovedSpenderOfDSC(initialBalance+_amount);
+        }
     }
 
       /////////////////////////////////////////////
@@ -272,6 +297,20 @@ contract DSCEngine is ReentrancyGuard{
         AggregatorV3Interface priceFeed = AggregatorV3Interface(s_priceFeeds[token]);
         (,int256 price,,,) = priceFeed.latestRoundData();
         return (usdAmount * PRECISION_CORRECTION) / (uint256(price) * FEED_PRECISION_CORRECTION);
+    }
+
+    /*
+    /* @notice This function provides information for an account
+     * */
+    function getAccountInformation(address _user) external view returns(uint256 totalDSCMinted, uint256 collateralValueUSD){
+        return _getAccountInformation(_user);
+    }
+
+    /*
+     * @notice This function informs how close to liquidation a user is. If below 1; user can get liquidated
+     * */
+    function getHealthFactor(address _user) external view returns(uint256) {
+        return _healthFactor(_user);
     }
 
 }
